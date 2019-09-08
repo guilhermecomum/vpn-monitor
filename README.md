@@ -12,7 +12,7 @@ pip3 install -r requirements.txt
 
 Para executar o monitor:
 ```
-python3 vpnmonitor/app.py
+sudo python3 vpnmonitor/app.py
 ```
 
 Para monitorar as rotas pelo SO:
