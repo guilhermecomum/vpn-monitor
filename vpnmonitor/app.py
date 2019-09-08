@@ -1,65 +1,98 @@
+import os
+import signal
 import time
-from typing import Union
+from _socket import AF_INET
 
-from pyroute2 import IPDB, IPRoute
+from get_nic import getnic
+from pyroute2 import IPDB
 from pyroute2.ipdb.main import Watchdog
 
-print('Inicializando...')
-
-
-def prompt_sudo():
-    import os, subprocess
-    user_uid = os.geteuid()
-    if user_uid != 0:
-        return subprocess.check_call("sudo -v -p '%s'" % "[SUDO] senha para %u:", shell=True)
-    return user_uid
-
+DEFAULT_PRIORITY: int = 256
 
 print('Verificando permissoes de root')
-if prompt_sudo() != 0:
+if os.geteuid() != 0:
     print('Saindo! Necessario permissoes de root')
     exit()
 
-
-def delete_route(origin: str, route: object):
-    print(origin + 'Deletando rota de rede ', route)
-    from pyroute2 import IPRoute
-    iproute_del: Union[IPRoute, IPRoute, IPRoute] = IPRoute()
-    iproute_del.route("del", table=route.get("table"),
-                             family=route.get("family"),
-                             scope=route.get("scope"),
-                             dst_len=route.get("dst_len"),
-                             src_len=route.get("src_len"),
-                             tos=route.get("tos"),
-                             flags=route.get("flags"),
-                             type=route.get("type"),
-                             proto=route.get("proto"),
-                             attrs=route.get("attrs"))
-    iproute_del.close()
+keep_running: bool = True
 
 
-def watchdog_callback(ipdb: object, route: object, action: object):
-    if action == 'RTM_NEWROUTE':
-        for attrs in route.get("attrs", []):
-            if attrs[0] == 'RTA_PRIORITY' and attrs[1] > 15000:
-                print('[watchdog] Encontrado rota de rede com erro')
-                delete_route('[watchdog] ', route)
+def exit_gracefully(signum: object, frame: object):
+    global keep_running
+    keep_running = False
+
+
+print('Inicializando...')
+signal.signal(signal.SIGINT, exit_gracefully)
+signal.signal(signal.SIGTERM, exit_gracefully)
+
+oifs:list = []
+default_routes: list = []
+
+print('Verificando intefaces de rede')
+
+
+def store_default_routes(ipdb: object):
+    global oifs, default_routes
+    oifs = []
+    default_routes = []
+    interfaces: list = [x for x in getnic.interfaces() if (x != 'lo')]
+    for interface in interfaces:
+        try:
+            index: int = ipdb.interfaces[interface].get('index')
+            oifs.append(index)
+            default_routes.append(ipdb.routes[{'dst': 'default', 'family': AF_INET, 'oif': index}])
+        except KeyError:
+            pass
 
 
 print('Verificando rotas de rede')
-iproute: Union[IPRoute, IPRoute, IPRoute] = IPRoute()
-routes = iproute.get_routes()
+ipdb: IPDB = IPDB()
+store_default_routes(ipdb)
 
-for idx in range(len(routes)):
-    for attrs in routes[idx].get('attrs', []):
-        if attrs[0] == 'RTA_PRIORITY' and attrs[1] > 15000:
-            print('Encontrado rota de rede com erro')
-            delete_route('', routes[idx])
 
-iproute.close()
+def delete_route(ipdb: object, route: object):
+    for default_route in default_routes:
+        if route.get_attr('RTA_OIF') == default_route.get('oif'):
+            print('[watchdog]', 'Apagando a rota', route)
+            ipdb.routes.remove({'dst': 'default',
+                                'family': AF_INET,
+                                'oif': route.get_attr('RTA_OIF'),
+                                'gateway': route.get_attr('RTA_GATEWAY'),
+                                'priority': route.get_attr('RTA_PRIORITY')})
+            ipdb.commit()
+            try:
+                ipdb.routes[{'dst': 'default', 'family': AF_INET, 'oif': route.get_attr('RTA_OIF')}]
+            except KeyError:
+                ipdb.routes.add({'dst': 'default',
+                                 'family': AF_INET,
+                                 'oif': route.get_attr('RTA_OIF'),
+                                 'gateway': route.get_attr('RTA_GATEWAY'),
+                                 'priority': default_route.get('priority') or DEFAULT_PRIORITY,
+                                 'scope': route.get('scope'),
+                                 'dst_len': route.get('dst_len'),
+                                 'src_len': route.get('src_len'),
+                                 'tos': route.get('tos'),
+                                 'flags': route.get('flags'),
+                                 'type': route.get('type'),
+                                 'proto': route.get('proto')})
+                ipdb.commit()
+
+
+def watchdog_callback(ipdb: object, message: object, action: object):
+    global oifs, default_routes
+    if action in ('RTM_NEWADDR', 'RTM_NEWLINK'):
+        store_default_routes(ipdb)
+        print('[watchdog]', action, 'Rotas default:', default_routes)
+    if action == 'RTM_NEWROUTE':
+        if message.get('family') == AF_INET \
+                and message.get_attr('RTA_OIF') in oifs \
+                and 20000 < message.get_attr('RTA_PRIORITY') < 21000:
+            print('[watchdog]', action, 'Nova rota: ', message)
+            delete_route(ipdb, message)
+
 
 print('Inicializando watchdog')
-ipdb: IPDB = IPDB()
 watchdog: Watchdog = ipdb.watchdog()
 watchdog.wait()
 
@@ -67,14 +100,14 @@ print('Registrando callback')
 callback: int = ipdb.register_callback(watchdog_callback)
 
 print('Monitorando rotas de rede... <[CTRL] + C> para encerrar!')
-while True:
+while keep_running:
     try:
-        time.sleep(5)
+        time.sleep(1)
     except KeyboardInterrupt:
-        print('Des-registrando callback')
-        ipdb.unregister_callback(callback)
-        print('Finalizando watchdog')
-        ipdb.release()
         break
 
+print('Des-registrando callback')
+ipdb.unregister_callback(callback)
+print('Finalizando watchdog')
+ipdb.release()
 print('Terminando... Laterz!')

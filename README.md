@@ -15,7 +15,11 @@ Para executar o monitor:
 python3 vpnmonitor/app.py
 ```
 
+Para monitorar as rotas pelo SO:
+``` 
+clear; while true; do printf "\033[1;1H"; route -n; sleep 1; clear; done
 
+```
 ## TODO
 
 - Habilitar logger
