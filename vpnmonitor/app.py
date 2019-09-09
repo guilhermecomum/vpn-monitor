@@ -26,78 +26,97 @@ print('Inicializando...')
 signal.signal(signal.SIGINT, exit_gracefully)
 signal.signal(signal.SIGTERM, exit_gracefully)
 
-oifs:list = []
-default_routes: list = []
-
-print('Verificando intefaces de rede')
+oifs: list = []
 
 
-def store_default_routes(ipdb: object):
-    global oifs, default_routes
-    oifs = []
-    default_routes = []
-    interfaces: list = [x for x in getnic.interfaces() if (x != 'lo')]
-    for interface in interfaces:
-        try:
+def store_interfaces_oifs(ipdb: object):
+    try:
+        global oifs
+        oifs = []
+        interfaces: list = [x for x in getnic.interfaces() if (x != 'lo')]
+        for interface in interfaces:
             index: int = ipdb.interfaces[interface].get('index')
-            oifs.append(index)
-            default_routes.append(ipdb.routes[{'dst': 'default', 'family': AF_INET, 'oif': index}])
-        except KeyError:
-            pass
+        oifs.append(index)
+    finally:
+        print('Monitorando intefaces de rede: ', oifs)
 
 
-print('Verificando rotas de rede')
-ipdb: IPDB = IPDB()
-store_default_routes(ipdb)
+def get_default_routes(ipdb: object):
+    try:
+        global oifs
+        default_routes = ipdb.routes.filter('default')
+        routes = [x.get('route') for x in default_routes]
+        return [x for x in routes if x.get('family') == AF_INET and x.get('oif') in oifs]
+    except KeyError:
+        return []
 
 
-def delete_route(ipdb: object, route: object):
-    for default_route in default_routes:
-        if route.get_attr('RTA_OIF') == default_route.get('oif'):
-            print('[watchdog]', 'Apagando a rota', route)
+def verify_valid_route(ipdb: object, oif: int, gateway: str):
+    try:
+        routes = get_default_routes(ipdb)
+        if len([x for x in routes if x.get('oif') == oif
+                                     and x.get('gateway') == gateway
+                                     and 0 < x.get('priority') < 2000]) != 0:
+            return True
+        return False
+    except:
+        return False
+
+
+def delete_invalid_route(ipdb: object, oif: int, gateway: str):
+    try:
+        routes = get_default_routes(ipdb)
+        invalid_routes = [x for x in routes if x.get('oif') == oif
+                          and x.get('gateway') == gateway
+                          and 20000 < x.get('priority') < 21000]
+        for invalid_route in invalid_routes:
+            print('[watchdog]', 'Apagando rota invalida', invalid_route)
             ipdb.routes.remove({'dst': 'default',
                                 'family': AF_INET,
-                                'oif': route.get_attr('RTA_OIF'),
-                                'gateway': route.get_attr('RTA_GATEWAY'),
-                                'priority': route.get_attr('RTA_PRIORITY')})
+                                'oif': invalid_route.get('oif'),
+                                'gateway': invalid_route.get('gateway'),
+                                'priority': invalid_route.get('priority')})
             ipdb.commit()
-            try:
-                ipdb.routes[{'dst': 'default', 'family': AF_INET, 'oif': route.get_attr('RTA_OIF')}]
-            except KeyError:
-                ipdb.routes.add({'dst': 'default',
-                                 'family': AF_INET,
-                                 'oif': route.get_attr('RTA_OIF'),
-                                 'gateway': route.get_attr('RTA_GATEWAY'),
-                                 'priority': default_route.get('priority') or DEFAULT_PRIORITY,
-                                 'scope': route.get('scope'),
-                                 'dst_len': route.get('dst_len'),
-                                 'src_len': route.get('src_len'),
-                                 'tos': route.get('tos'),
-                                 'flags': route.get('flags'),
-                                 'type': route.get('type'),
-                                 'proto': route.get('proto')})
-                ipdb.commit()
+    except:
+        pass
 
 
 def watchdog_callback(ipdb: object, message: object, action: object):
-    global oifs, default_routes
-    if action in ('RTM_NEWADDR', 'RTM_NEWLINK'):
-        store_default_routes(ipdb)
-        print('[watchdog]', action, 'Rotas default:', default_routes)
+    global oifs
+    if action in ('RTM_NEWADDR', 'RTM_NEWLINK') \
+            and ipdb.interfaces[message.get_attr('RTA_OIF')].get('operstate') == 'UP':
+        store_interfaces_oifs(ipdb)
     if action == 'RTM_NEWROUTE':
         if message.get('family') == AF_INET \
                 and message.get_attr('RTA_OIF') in oifs \
                 and 20000 < message.get_attr('RTA_PRIORITY') < 21000:
-            print('[watchdog]', action, 'Nova rota: ', message)
-            delete_route(ipdb, message)
+            if verify_valid_route(ipdb, message.get_attr('RTA_OIF'), message.get_attr('RTA_GATEWAY')):
+                print('[watchdog]', action, 'Encontrado rota invalida: ', message)
+                delete_invalid_route(ipdb, message.get_attr('RTA_OIF'), message.get_attr('RTA_GATEWAY'))
 
+
+print('Verificando rotas de rede')
+main_ipdb: IPDB = IPDB()
+store_interfaces_oifs(main_ipdb)
 
 print('Inicializando watchdog')
-watchdog: Watchdog = ipdb.watchdog()
+watchdog: Watchdog = main_ipdb.watchdog()
 watchdog.wait()
 
 print('Registrando callback')
-callback: int = ipdb.register_callback(watchdog_callback)
+callback: int = main_ipdb.register_callback(watchdog_callback)
+
+print('Validando rotas atuais')
+try:
+    routes = get_default_routes(main_ipdb)
+    routes = [x for x in routes if 20000 < x.get('priority') < 21000]
+    if len(routes) != 0:
+        for route in routes:
+            if verify_valid_route(main_ipdb, route.get('oif'), route.get('gateway')):
+                print('[watchdog]', 'Encontrado rota invalida: ', route)
+                delete_invalid_route(main_ipdb, route.get('oif'), route.get('gateway'))
+except:
+    pass
 
 print('Monitorando rotas de rede... <[CTRL] + C> para encerrar!')
 while keep_running:
@@ -107,7 +126,7 @@ while keep_running:
         break
 
 print('Des-registrando callback')
-ipdb.unregister_callback(callback)
+main_ipdb.unregister_callback(callback)
 print('Finalizando watchdog')
-ipdb.release()
+main_ipdb.release()
 print('Terminando... Laterz!')
